@@ -14,7 +14,7 @@
 #   VISION=0 ./start.sh restart        # text only
 # Extra arguments come after the defaults, so they win (the last value of a flag counts).
 # Settings, from the environment or ./.env (KEY=value lines): PARALLEL, CONTEXT, YARN_FACTOR, PREFILL_FP8, VISION, VISION_URLS,
-#      TEMPERATURE, TOP_P, TOP_K, THINKING, CHECKPOINT_SLOTS, SERVED_NAME, PORT, HOST, CONTAINER_NAME, IMAGE, MODEL_ID,
+#      KV_POOL_GB, KV_DTYPE, TEMPERATURE, TOP_P, TOP_K, THINKING, CHECKPOINT_SLOTS, SERVED_NAME, PORT, HOST, CONTAINER_NAME, IMAGE, MODEL_ID,
 #      DRAFT_ID (see scripts/config.sh); TENSORFOLD_* (passed to the server);
 #      PREPARE (auto | 1 | 0); FOREGROUND=1 (stay attached, exit with the server's code); WAIT_TIMEOUT (seconds,
 #      default 1800); HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
@@ -126,6 +126,19 @@ if (( avail_gb >= 103 )); then
 else
   warn "only ${avail_gb} GiB memory available (the default needs ~103): stop other GPU workloads (docker ps), or lower PARALLEL / CONTEXT"
 fi
+
+# The pinned KV pool, "auto": what is free now minus the memory everything else needs (weights, drafter, per-stream
+# buffers: ~31 GiB at 8 streams, ~3 GiB more for each extra 262,144 tokens of window with YARN_FACTOR), at most 78 GiB.
+if [[ "$KV_POOL_GB" == auto ]]; then
+  extra=$(awk -v f="${YARN_FACTOR:-1}" 'BEGIN { x = 3 * (f - 1); printf "%d", (x == int(x)) ? x : int(x) + 1 }')
+  KV_POOL_GB=$(( avail_gb - 31 - extra - (PARALLEL > 8 ? (PARALLEL - 8) * 1 : 0) ))
+  (( KV_POOL_GB <= 78 )) || KV_POOL_GB=78
+  if (( KV_POOL_GB < 8 )); then
+    die "only ${avail_gb} GiB memory available: not enough for the model and a KV pool (need ~40+). Stop other GPU workloads (docker ps), or set KV_POOL_GB=0 to let the caches grow on demand"
+  fi
+  log "KV pool: auto, ${KV_POOL_GB} GiB (${avail_gb} GiB free now; KV_POOL_GB=<n> sets it, 0 turns the pin off)"
+fi
+[[ -z "$KV_POOL_GB" || "$KV_POOL_GB" == 0 ]] || export TENSORFOLD_KV_POOL_GIB="$KV_POOL_GB"
 
 # TensorFold's own switches from the environment (TENSORFOLD_*, e.g. TENSORFOLD_MTP_COPY) reach the server too.
 ENV_ARGS=()

@@ -68,8 +68,10 @@ clients. A single request decodes the same at every `PARALLEL`.
 
 ## Pinned KV pool
 
-`KV_POOL_GB=78` (patch 0005) reserves **78 GiB of attention cache at startup**, 2,555,904 tokens at 32 KiB, and keeps
-it: the server process holds ~97 GiB from the first second (weights, drafter and buffers ~19 GiB, plus the pool) and
+`KV_POOL_GB` (patch 0005, default `auto`) reserves **up to 78 GiB of attention cache at startup**, 2,555,904 tokens at
+32 KiB, and keeps it. `auto` sizes it from the memory free when `start.sh` runs (free GiB minus ~31 for everything else,
+at most 78: a Spark with ~109 GiB free gets the full 78, one with 90 GiB free gets 59) and prints the result; a number
+sets it, `0` turns the pin off. It reserves it and keeps it: the server process holds ~97 GiB from the first second (weights, drafter and buffers ~19 GiB, plus the pool) and
 that number does not move. The streams' caches and the kept prompt states grow inside the pool, the memory gate counts
 them against it, and a request that does not fit waits for others to finish. Nothing is given back to the system, and
 the host's free memory is no longer consulted for KV, so other workloads cannot take it. Eight full 262,144-token
@@ -133,7 +135,7 @@ difference). Any factor of 1 or more works.
 **Enable 1M context**
 
 ```bash
-YARN_FACTOR=4 KV_POOL_GB=70 ./start.sh restart
+YARN_FACTOR=4 ./start.sh restart
 ```
 
 That is all: `CONTEXT` follows the factor (262,144 x 4 = 1,048,576), so nothing else needs setting. Make it permanent
@@ -141,7 +143,6 @@ by putting the lines in a `.env` file next to `start.sh`:
 
 ```bash
 echo 'YARN_FACTOR=4' >> .env
-echo 'KV_POOL_GB=70'  >> .env
 ./start.sh restart
 ```
 
@@ -152,13 +153,14 @@ Check it took: the startup log must say `native 1048576, allocated prompt/reply 
 `... pinned 70.0 GiB cache pool (2,293,760 tokens)`, `docker logs qwen38-27b-tf | grep -E 'estimate|pool|context'`, and
 `curl -s localhost:8888/v1/models` answers. To go back: remove the two lines (or `YARN_FACTOR= ./start.sh restart`).
 
-**Why `KV_POOL_GB=70` and not the default 78:** the startup estimate counts the pinned pool beside per-stream scratch that
-grows with the window, and a 1M window needs ~8 GiB more of it than a 262k one. At 8 streams 78 GiB is refused (the
-refusal names the window that would fit, 447,487 tokens); 70 GiB starts (estimate 108.7 of 109.7 GiB). Other settings:
+**The pool shrinks for 1M:** the startup estimate counts the pinned pool beside per-stream scratch that grows with the
+window, and a 1M window needs ~9 GiB more of it than a 262k one, so `auto` picks ~70 GiB instead of 78 (a fixed
+`KV_POOL_GB=78` is refused with a 1M window: the refusal names the window that would fit, 447,487 tokens; 70 starts, estimate
+108.7 of 109.7 GiB). Tested settings:
 
 | Setting (8 streams) | Result |
 | --- | --- |
-| `YARN_FACTOR=4 KV_POOL_GB=70` | starts: estimate 108.72 of 109.71 GiB, pool 2,293,760 tokens (two full 1M streams, or 8 streams of ~290k) |
+| `YARN_FACTOR=4` (`auto` pool: ~70) | starts: estimate 108.72 of 109.71 GiB, pool 2,293,760 tokens (two full 1M streams, or 8 streams of ~290k) |
 | `YARN_FACTOR=4` with the default pool (78) | refused at startup, before any weights load: largest fitting window 447,487 tokens |
 
 Fewer streams or `KV_POOL_GB=0` (no pin, caches grow on demand) leave more room; if a setting is refused, the message
@@ -238,6 +240,8 @@ engine and have no counterpart here. KV-cache quantization is Flash Next only.
 ## Quick start
 
 ```bash
+git clone https://github.com/MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold.git
+cd Qwen3.8-27B-DGX-Spark-TensorFold
 ./start.sh
 ```
 
@@ -272,7 +276,7 @@ Every setting is in [`scripts/config.sh`](scripts/config.sh); override from the 
 | `PARALLEL` | `8` | requests decoded together; `1` serves one at a time |
 | `CONTEXT` | `262144` | prompt + reply window per stream (times `YARN_FACTOR`) |
 | `YARN_FACTOR` | unset | YaRN rope scaling factor, e.g. `4` for a 1,048,576-token window ([guide](#longer-context-with-yarn-a-1m-token-window)) |
-| `KV_POOL_GB` | `78` | GiB of attention cache pinned at startup and shared by all streams ([KV pool](#pinned-kv-pool)); empty or `0`: grow on demand |
+| `KV_POOL_GB` | `auto` | GiB of attention cache pinned at startup and shared by all streams: `auto` = the free memory minus ~31, at most 78 ([KV pool](#pinned-kv-pool)); a number sets it; `0`: grow on demand |
 | `KV_DTYPE` | `fp8` | attention cache: `fp8` (e4m3, 32 KiB a token) or `bf16` (64 KiB) ([above](#fp8-kv-cache)) |
 | `PREFILL_FP8` | `1` | FP8 prompt activations: faster prefill, lower prompt precision; `0` for bf16 |
 | `VISION` / `VISION_URLS` | `1` / `0` | image and video input (MLX checkpoint only) / also fetch `https://` URLs |

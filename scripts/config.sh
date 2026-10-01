@@ -72,10 +72,11 @@ export TENSORFOLD_KV_DTYPE="$KV_DTYPE"
 
 # Pinned KV pool (patches/0005): GiB of attention cache reserved once at startup and shared by every stream and kept
 # prompt state; the caches grow inside it, nothing is given back, and a request that does not fit waits. 32 KiB a
-# token with the FP8 cache, so 78 GiB is ~2.5M tokens. Empty or 0: caches grow on demand (the 20 GiB you see at idle).
-# The startup estimate counts it, so it must fit beside the weights and per-stream buffers (~37 GiB at 16 streams).
-KV_POOL_GB="${KV_POOL_GB:-78}"
-[[ -z "$KV_POOL_GB" || "$KV_POOL_GB" == 0 ]] || export TENSORFOLD_KV_POOL_GIB="$KV_POOL_GB"
+# token with the FP8 cache, so 78 GiB is ~2.5M tokens. "auto" (the default): start.sh sizes it from the memory that is
+# free when it starts, at most 78 (a Spark with ~109 GiB free gets the full 78; with less, a smaller pool that still
+# starts). A number sets it; 0 or empty: no pin, caches grow on demand (the ~20 GiB you see at idle).
+KV_POOL_GB="${KV_POOL_GB:-auto}"
+[[ "$KV_POOL_GB" == auto || -z "$KV_POOL_GB" || "$KV_POOL_GB" == 0 ]] || export TENSORFOLD_KV_POOL_GIB="$KV_POOL_GB"
 
 # Startup reserve: GiB left out of MemAvailable at admission and kept free by the stream memory gate. TensorFold's own
 # default is max(4 GiB, a tenth of RAM) and its floor 2; patches/0004 allows 0, which is the default here: the budget
