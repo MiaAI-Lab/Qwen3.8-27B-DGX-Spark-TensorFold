@@ -57,13 +57,12 @@ the first token).
 | 64k | 65,576 | 1,415.9 tok/s | 46.31 s |
 | 128k | 131,111 | 1,117.8 tok/s | 117.29 s |
 
-Longer prompts, measured here with `tools/needle.py` on the default server (window 262,144): 195k tokens in 205 s
+Longer prompts, measured here with a needle-in-a-haystack prompt on the default server (window 262,144): 195k tokens in 205 s
 (948 tok/s) and 255,897 tokens in 315 s (812 tok/s). With YaRN: 491k in 924 s and 884k in 2,664 s
 ([guide](#longer-context-with-yarn-a-1m-token-window)).
 
-**Our own run** with this repository's `tools/bench.py` (2026-10-01, fixed seeds, thinking off, 8 streams; other prompts
-and counting than sparkDash, so the decode figures are lower and not comparable one to one; details and the other arms
-in [`docs/measurements.md`](docs/measurements.md)): per request 48.6 tok/s alone, aggregate 93 / 136 / 150 tok/s at
+**Our own run** with a fixed-seed benchmark script (2026-10-01, thinking off, 8 streams; other prompts and counting than
+sparkDash, so the decode figures are lower and not comparable one to one): per request 48.6 tok/s alone, aggregate 93 / 136 / 150 tok/s at
 2 / 4 / 8 clients; prefill 1,862 tok/s at 8k, 1,663 at 31k, 1,147 at 126k. `PARALLEL=16` reached 207 tok/s at 16
 clients. A single request decodes the same at every `PARALLEL`.
 
@@ -107,7 +106,7 @@ each layer's rows widened to bf16 (a transient 2 x window x 2 KiB per layer, cou
 | C=8 aggregate decode | 150 tok/s | 146 tok/s |
 
 Quality, measured in the engine on 8 sequences of 4,096 tokens (4 wikitext-2 test, 4 CPython source, two 2,048-row
-chunks so the second reads cached keys; `tools/kvquality.py`), against the bf16 cache with bf16 prompts:
+chunks so the second reads cached keys), against the bf16 cache with bf16 prompts:
 
 | | Perplexity | KL to reference | Top-1 agreement |
 | --- | ---: | ---: | ---: |
@@ -119,7 +118,7 @@ chunks so the second reads cached keys; `tools/kvquality.py`), against the bf16 
 The cache costs far less than the prompt precision: FP8 prompts are ~14x the KL of the FP8 cache, so if quality
 matters more than prefill speed, `PREFILL_FP8=0` is the setting to change first. Greedy open-ended replies do
 diverge from the bf16 cache's after a few tokens (as they do for any numeric change); a 12-question reasoning probe
-(`tools/qualitycheck.py`) scored 12/12 with the FP8 cache and 11/12 with bf16 (one retrieval miss: noise at this
+scored 12/12 with the FP8 cache and 11/12 with bf16 (one retrieval miss: noise at this
 size), and the needle is found at 195k and, with YaRN, at 491k tokens. Only 4k-token contexts were scored by KL;
 long-context quality was checked with needles only.
 
@@ -204,7 +203,8 @@ A video is a `video_url` part (`{"type": "video_url", "video_url": {"url": "data
 By default only data URLs are accepted; `VISION_URLS=1` also lets the server fetch public `https://` URLs. A request
 body can be up to 96 MiB (base64 makes data URLs a third larger than the files). Image and video prompts are not
 kept for prefix reuse, so each turn of a chat with media processes it again. Text requests are unaffected. Needs the
-MLX checkpoint: the NVFP4 one cannot take images or video. Measured: [`docs/measurements.md`](docs/measurements.md#images-and-video).
+MLX checkpoint: the NVFP4 one cannot take images or video. Tested: 50 images in one request (a 51st is refused),
+50 full-HD photos (15,735 tokens, 13 s), a 6-second video and a 90-second 1280x720 video (16,135 tokens, 12.5 s).
 
 ## What was tuned, and what was not
 
@@ -287,18 +287,11 @@ Every setting is in [`scripts/config.sh`](scripts/config.sh); override from the 
 
 ## Checks
 
-`tools/` talks to the running server (`API_URL` or `PORT`; `MODEL_NAME` if you changed `SERVED_NAME`).
-
-| Script | What it does |
-| --- | --- |
-| `tools/bench.py [label]` | smoke: prefill at ~0.85k-50k tokens and a decode check. `--suite --seed 1 --jsonl run.jsonl --clients 1,2,4,8` is the concurrent, fixed-seed driver |
-| `tools/prefill_curve.py` | cold prefill at 8k-126k tokens |
-| `tools/needle.py` | a passphrase hidden in a ~195k-token prompt |
-| `tools/toolcheck.py` | a tool call with an array parameter comes back as a JSON array |
-| `tools/visioncheck.py` | a drawn image (red circle, blue square) must be described correctly |
-| `tools/kvquality.py` | KL and perplexity of the FP8 cache and FP8 prompts against bf16 (run inside the image with the engine loaded: needs the GPU, ~25 GiB; stop nothing else) |
-| `tools/qualitycheck.py` | 12 checkable questions, greedy; `--out` and `--compare` to diff two servers |
-| `tools/mediacheck.py` | 50 images in one request (51 must be refused) and a red-green-blue video whose colour order must be right (needs `pip install pillow numpy av` on the client) |
+`start.sh` ends with a smoke test, and `/health` shows the busy flag and live token totals. Every figure in this README
+came from an OpenAI-compatible client talking to `/v1/chat/completions` (streaming, fixed seeds, `return_token_ids`
+for exactness checks), so any such client reproduces them. The benchmark and check scripts used for the measurements
+here (decode and prefill benchmark, needle, tool call, image and video, KL and quality probes) are not part of this
+repository.
 
 ## Repository layout
 
@@ -307,8 +300,6 @@ start.sh, stop.sh   set up (first run) and start / stop the server
 scripts/            prepare.sh (image + checkpoints), config.sh (all settings), banner.sh (start.sh's banner),
                     publish-image.sh (push the image to GitHub Container Registry)
 patches/            patches baked into the image (0001: 50 images and video; 0002: YaRN; 0003: FP8 KV cache; 0004: memory reserve 0; 0005: KV pool)
-tools/              benchmark and checks
-docs/               measurements
 LICENSE, NOTICE, LICENSES/, CREDITS.md   Apache-2.0 license, notices of the MIT parts, and who built what
 ```
 

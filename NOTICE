@@ -25,8 +25,8 @@ It contains, or modifies, the following work by others:
 
 2. The Qwen3.8 Flash Next recipe by MiaAI-Lab
    (https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold), MIT, copyright (c) 2026 MiaAI-Lab
-   (LICENSES/MIT-MiaAI-Lab.txt). start.sh, stop.sh, scripts/prepare.sh, scripts/config.sh, tools/bench.py,
-   tools/needle.py, tools/toolcheck.py and tools/visioncheck.py are adapted from it, and patches/0001 carries its video
+   (LICENSES/MIT-MiaAI-Lab.txt). start.sh, stop.sh, scripts/prepare.sh and scripts/config.sh are adapted from it (as were the benchmark scripts behind the
+   measurements, which are not part of this repository), and patches/0001 carries its video
    code (vision/videos.py and the video parts of vision/qwen_processing.py and vision/qwen_cuda.py). MIT is a
    permissive license: those parts stay under its notice while the repository as a whole is under Apache-2.0.
 

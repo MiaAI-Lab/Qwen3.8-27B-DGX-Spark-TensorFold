@@ -35,8 +35,8 @@ This repository is a layer of scripts and patches. Almost everything that makes 
 
 - **[MiaAI-Lab](https://github.com/MiaAI-Lab)** ([x.com/MiaAI_lab](https://x.com/MiaAI_lab)), the
   [Qwen3.8 Flash Next on one DGX Spark](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)
-  recipe (MIT, kept under its notice in `LICENSES/MIT-MiaAI-Lab.txt`). `start.sh`, `stop.sh`, `scripts/prepare.sh`, `scripts/config.sh`, `tools/bench.py`, `tools/needle.py`,
-  `tools/toolcheck.py`, `tools/visioncheck.py` and the layout and measurement method of this README are adapted from it.
+  recipe (MIT, kept under its notice in `LICENSES/MIT-MiaAI-Lab.txt`). `start.sh`, `stop.sh`, `scripts/prepare.sh`, `scripts/config.sh`, the benchmark scripts behind the measurements (not in this repository)
+  and the layout and measurement method of this README are adapted from it.
   The **video** support in `patches/0001` (`vision/videos.py`, the timestamped frame-group prompt, the frame encoding)
   is ported from that recipe's `patches/0002-flash-next-v060.patch` (MIT); MiaAI-Lab's work there builds on TensorFold's Qwen
   image pipeline, Hugging Face transformers' Qwen3-VL video processing, and PyAV.
@@ -56,8 +56,7 @@ This repository is a layer of scripts and patches. Almost everything that makes 
   (Apache 2.0), which the patch is checked against numerically.
 - **0003**: an FP8 (e4m3) attention cache read directly by the tree-attention kernels; **0004**: a memory reserve of 0;
   **0005**: a pinned KV pool for the concurrent decoder.
-- Patches 0002-0005, the quality tools (`tools/kvquality.py`, `tools/qualitycheck.py`), `tools/mediacheck.py`,
-  `tools/prefill_curve.py`, `scripts/banner.sh`, `docs/measurements.md` and this documentation were developed with
+- Patches 0002-0005, `scripts/banner.sh` and this documentation were developed with
   [Claude Code](https://claude.com/claude-code).
 
 ## Runtime stack
