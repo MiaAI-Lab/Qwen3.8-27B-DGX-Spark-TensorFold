@@ -1,0 +1,46 @@
+Qwen3.8-27B on TensorFold v0.6.0 (c464617): TENSORFOLD_MEMORY_RESERVE_GIB may be 0 (the stock floor is 2 GiB), and the
+stream memory gate of the dense 27B decoder reads the same variable instead of a fixed 2 GiB. With 0 the budget is all of
+MemAvailable (reclaimable page cache included). Applies after 0003.
+
+--- tensorfold/cuda/capacity.py
++++ tensorfold/cuda/capacity.py
+@@ -157,7 +157,7 @@
+ 
+ 
+ def reserve_bytes(total: int, *, host: bool = False) -> int:
+-    """What the startup budget leaves free: max(4 GiB, a tenth of ``total``), or TENSORFOLD_MEMORY_RESERVE_GIB (>= 2)."""
++    """What the startup budget leaves free: max(4 GiB, a tenth of ``total``), or TENSORFOLD_MEMORY_RESERVE_GIB (>= 0; the stock floor was 2)."""
+ 
+     value = os.environ.get("TENSORFOLD_MEMORY_RESERVE_GIB", "").strip()
+     if not value:
+@@ -166,8 +166,8 @@
+         gib = float(value)
+     except ValueError:
+         gib = math.nan
+-    if not 2 <= gib <= total / GIB:
+-        raise ValueError(f"TENSORFOLD_MEMORY_RESERVE_GIB={value}: a number of GiB from 2 to the memory's size")
++    if not 0 <= gib <= total / GIB:
++        raise ValueError(f"TENSORFOLD_MEMORY_RESERVE_GIB={value}: a number of GiB from 0 to the memory's size")
+     return int(gib * GIB)
+ 
+ 
+--- tensorfold/families/qwen3_5/cuda/multi.py
++++ tensorfold/families/qwen3_5/cuda/multi.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import time
+ 
+ import torch
+@@ -105,7 +106,8 @@
+ 
+         self.layer_bytes = 2 * getattr(c, "kv_heads", 0) * getattr(c, "head_dim", 0) * kv_fp8.itemsize()   # a row of one layer
+         self.row_bytes = att * self.layer_bytes
+-        self.memory_gate = (MemoryGate(1 << 62, reserve=2 * GIB, live=torch_live(torch, available_bytes))
++        self.memory_gate = (MemoryGate(1 << 62, reserve=int(float(os.environ.get("TENSORFOLD_MEMORY_RESERVE_GIB") or 2) * GIB),
++                                   live=torch_live(torch, available_bytes))
+                      if world == 1 and torch.cuda.is_available() else None)
+ 
+     def live(self) -> int:

@@ -1,0 +1,299 @@
+Qwen3.8-27B on TensorFold v0.6.0 (c464617): opt-in FP8 (e4m3) attention cache for the dense CUDA engine.
+TENSORFOLD_KV_DTYPE=fp8 stores keys and values as float8_e4m3fn (one byte, no scale, saturating), half of bf16. The rows a
+forward attends to are rounded through e4m3 before use, so a key reads alike in a draft window and in the cache (drafted
+replies still equal serial ones); the tree-attention kernels read FP8 caches directly, the prompt kernel is given the
+cache's rows widened to bf16 for the layer. Unset, the engine is unchanged. Applies after 0001 and 0002.
+
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -149,16 +149,17 @@
+     return max(512, min(most, total // PROMPT_SHARE // row_bytes // 512 * 512))
+ 
+ 
+-def live_kv(t: dict, world: int, window: int) -> int:
+-    """A dense stream's attention caches at ``window`` rows (1,024 at least) and one layer's buffer mid-grow."""
++def live_kv(t: dict, world: int, window: int, kv_item: int = 2) -> int:
++    """A dense stream's attention caches at ``window`` rows (1,024 at least) and one layer's buffer mid-grow (``kv_item``: bytes a cached value, 2 for bf16, 1 for FP8)."""
+ 
+     _, attention = layer_counts(t)
+-    return (attention + 1) * max(1024, window) * int(t["num_key_value_heads"]) // world * int(t["head_dim"]) * 4
++    return (attention + 1) * max(1024, window) * int(t["num_key_value_heads"]) // world * int(t["head_dim"]) * 2 * kv_item
+ 
+ 
+ def gdn_geometry(t: dict, world: int, reserve: int, *, indexed: bool = False, mtp: bool = False,
+-                 kv_bits: int = 16, rows: int | None = None, prompt: int = 0, evicts: bool = False) -> Geometry:
+-    """``rows``: widest verify; ``prompt``: chunk rows sharing its scratch; ``evicts``: only the live window counts."""
++                 kv_bits: int = 16, rows: int | None = None, prompt: int = 0, evicts: bool = False,
++                 kv_item: int = 2) -> Geometry:
++    """``rows``: widest verify; ``prompt``: chunk rows sharing its scratch; ``evicts``: only the live window counts; ``kv_item``: bytes a cached value of the dense (non-indexed) path."""
+ 
+     linear, attention = layer_counts(t)
+     d, h = int(t["hidden_size"]), int(t["num_attention_heads"]) // world
+@@ -200,8 +201,11 @@
+         else:
+             # Bound two retained prefixes, current KV state and a growth copy; speculative rows use separate workspace.
+             rounded = 1 << (max(1024, capacity - reserve) - 1).bit_length()
+-            cache = live_kv(t, world, capacity - reserve) if evicts else 4 * attention * rounded * hk * hd * 4
++            cache = live_kv(t, world, capacity - reserve, kv_item) if evicts else \
++                4 * attention * rounded * hk * hd * 2 * kv_item
+             scratch = rows * h * (hd + 2) * ((capacity + 511) // 512) * 4
++            if kv_item == 1:                          # the prompt kernel reads bf16: one layer's widened keys and values
++                scratch += 2 * capacity * hk * hd * 2
+         return fixed + cache + scratch
+     return Geometry(bytes_at, reserve)
+ 
+@@ -365,8 +369,9 @@
+             nk, nv, dk, dv, 2 * nk * dk + 2 * nv * dv + 2 * nv)
+ 
+ 
+-def stream_geometry(t: dict, world: int, streams: int, keep: int, *, first: int | None = None) -> Geometry:
+-    """The 27B's concurrent decoder: live streams, ``keep`` kept prompt ends, windows; ``first``: growth on one GPU."""
++def stream_geometry(t: dict, world: int, streams: int, keep: int, *, first: int | None = None,
++                    kv_item: int = 2) -> Geometry:
++    """The 27B's concurrent decoder: live streams, ``keep`` kept prompt ends, windows; ``first``: growth on one GPU; ``kv_item``: bytes a cached value."""
+ 
+     linear, attention = layer_counts(t)
+     d, h, hk, hd, nk, nv, dk, dv, width = _gdn_dims(t, world)
+@@ -379,10 +384,12 @@
+     extent = d + int(t["vocab_size"]) // world + slots * (intermediate + d) + width + h * hd
+     fixed += 16 * max(128, rows) * extent * 4 + 32 * rows * 2560 * 4
+     def bytes_at(capacity: int) -> int:
+-        kv = attention * capacity * hk * hd * 2 * 2
++        kv = attention * capacity * hk * hd * 2 * kv_item
+         caches = (streams + keep + 1) * kv if first is None else \
+-            kv + (streams + keep) * attention * min(first, capacity) * hk * hd * 2 * 2
++            kv + (streams + keep) * attention * min(first, capacity) * hk * hd * 2 * kv_item
+         scratch = rows * h * (hd + 2) * ((capacity + 511) // 512) * 4
++        if kv_item == 1:                              # the prompt kernel reads bf16: one layer's widened keys and values
++            scratch += 2 * capacity * hk * hd * 2
+         return fixed + caches + kv // max(1, attention) + scratch   # one layer's growth copy
+     return Geometry(bytes_at, 1)
+ 
+--- tensorfold/cuda/kernels/attention.py
++++ tensorfold/cuda/kernels/attention.py
+@@ -10,6 +10,8 @@
+ import torch
+ import triton
+ import triton.language as tl
++
++from tensorfold.cuda import kv_fp8
+ 
+ TILE = 64
+ CHUNK = 512
+@@ -117,12 +119,12 @@
+             path_slot = logical - p
+             on_path = (path_slot >= 0) & (path_slot < depth)
+             path_node = tl.load(PATHS + node * MAXD + path_slot, mask=on_path, other=0)
+-            kc = tl.load(KC + koff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None], other=0)
+-            vc = tl.load(VC + voff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None], other=0)
++            kc = tl.load(KC + koff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None])   # lanes off the mask are never selected below
++            vc = tl.load(VC + voff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None])
+             kn = tl.load(KN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
+             vn = tl.load(VN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
+-            kk = tl.where(committed[:, None], kc, kn).to(tl.bfloat16)
+-            vv = tl.where(committed[:, None], vc, vn).to(tl.bfloat16)
++            kk = tl.where(committed[:, None], kc.to(tl.bfloat16), kn.to(tl.bfloat16))
++            vv = tl.where(committed[:, None], vc.to(tl.bfloat16), vn.to(tl.bfloat16))
+             m, l, o = _tile(q, kk, vv, m, l, o, committed | on_path, SCALE)
+         base = (chunk * W + node) * H + hk * G + gg
+         tl.store(PO + base[:, None] * D + d[None, :], o, mask=gg[:, None] < G)
+@@ -224,30 +226,30 @@
+ 
+ 
+ def base(device) -> torch.Tensor:
+-    """A fixed bf16 tensor that cache offsets are measured from (so an empty cache still has a valid offset)."""
++    """A fixed tensor of the cache's dtype that cache offsets are measured from (an empty cache still has a valid offset)."""
+ 
+     device = torch.device(device)
+-    return _base(device.index if device.index is not None else torch.cuda.current_device())
++    return _base(device.index if device.index is not None else torch.cuda.current_device(), kv_fp8.dtype())
+ 
+ 
+ @lru_cache(maxsize=None)
+-def _base(index: int) -> torch.Tensor:
+-    return torch.zeros(64, dtype=torch.bfloat16, device=torch.device("cuda", index))
++def _base(index: int, kind: torch.dtype) -> torch.Tensor:
++    return torch.zeros(64, dtype=kind, device=torch.device("cuda", index))
+ 
+ 
+ def offsets(caches: Sequence[tuple[torch.Tensor, torch.Tensor]], device) -> list[int]:
+-    """Each stream's key and value cache as bf16 element offsets from ``base(device)``, in stream order."""
++    """Each stream's key and value cache as element offsets (bf16, or FP8 bytes) from ``base(device)``, in stream order."""
+ 
+     origin = base(device).data_ptr()
+     out = []
+     for k, v in caches:
+         for t in (k, v):
+-            if t.dtype != torch.bfloat16 or not t.is_contiguous():
+-                raise ValueError("caches: contiguous bf16 tensors")
++            if t.dtype != kv_fp8.dtype() or not t.is_contiguous():
++                raise ValueError("caches: contiguous tensors of the cache dtype (bf16, or FP8 with TENSORFOLD_KV_DTYPE=fp8)")
+             delta = t.data_ptr() - origin
+             if delta % 16:
+                 raise ValueError("caches must be 16-byte aligned")
+-            out.append(delta // 2)
++            out.append(delta // t.element_size())
+     return out
+ 
+ 
+--- /dev/null
++++ tensorfold/cuda/kv_fp8.py
+@@ -0,0 +1,46 @@
++"""An FP8 (e4m3) attention cache for the dense Qwen3.8-27B CUDA engine (opt-in).
++
++``TENSORFOLD_KV_DTYPE=fp8`` stores each layer's keys and values as float8_e4m3fn, one byte a value (half of bf16), with
++no scale: saturated at +-448 and rounded to nearest. The rows a forward attends to are rounded the same way before
++they are used (``round``), so a key reads alike whether it is still in a draft window or already committed, and a
++drafted reply still equals the serial one. Unset, nothing here changes anything.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++LIMIT = 448.0                      # e4m3fn's largest finite value
++
++
++def enabled() -> bool:
++    value = os.environ.get("TENSORFOLD_KV_DTYPE", "").strip().lower()
++    if value in ("", "bf16"):
++        return False
++    if value in ("fp8", "fp8_e4m3", "e4m3"):
++        return True
++    raise ValueError(f"TENSORFOLD_KV_DTYPE: bf16 or fp8, not {value!r}")
++
++
++def dtype() -> torch.dtype:
++    return torch.float8_e4m3fn if enabled() else torch.bfloat16
++
++
++def itemsize() -> int:
++    return 1 if enabled() else 2
++
++
++def round(x: torch.Tensor) -> torch.Tensor:
++    """``x`` (bf16) as the cache will hold it: through e4m3, saturating. A no-op for a bf16 cache."""
++
++    if not enabled():
++        return x
++    return x.clamp(-LIMIT, LIMIT).to(torch.float8_e4m3fn).to(torch.bfloat16)
++
++
++def dense(cache: torch.Tensor, rows: int) -> torch.Tensor:
++    """The cache's first ``rows`` rows as bf16 (the prompt-attention kernel reads bf16): exact, e4m3 fits bf16."""
++
++    return cache[:rows] if cache.dtype == torch.bfloat16 else cache[:rows].to(torch.bfloat16)
+--- tensorfold/families/qwen3_5/cuda/engine.py
++++ tensorfold/families/qwen3_5/cuda/engine.py
+@@ -6,7 +6,7 @@
+ from pathlib import Path
+ from typing import Callable, Sequence
+ 
+-from tensorfold.cuda import prompt_precision
++from tensorfold.cuda import kv_fp8, prompt_precision
+ 
+ KEEP = 3             # prompt states a concurrent decoder keeps to resume from (each holds a DeltaNet copy)
+ KEEP_ONE = 4         # prompt states one stream keeps (they share its attention buffers)
+@@ -85,8 +85,11 @@
+         many = streams > 1
+         # prompt chunks sized to the card (4096 rows from 80 GB), the verify scratch to the rows a round takes
+         chunk = prompt_rows(total_bytes(torch), prompt_row_bytes(config(model_dir), tp))
+-        geometry = ((lambda text: stream_geometry(text, tp, streams, keep, first=256 if tp == 1 else None)) if many
+-                    else (lambda text: gdn_geometry(text, tp, max_rows, rows=max_rows, prompt=chunk, evicts=tp == 1)))
++        item = kv_fp8.itemsize()               # bytes a cached key or value: 2 (bf16), or 1 with TENSORFOLD_KV_DTYPE=fp8
++        geometry = ((lambda text: stream_geometry(text, tp, streams, keep, first=256 if tp == 1 else None,
++                                                  kv_item=item)) if many
++                    else (lambda text: gdn_geometry(text, tp, max_rows, rows=max_rows, prompt=chunk, evicts=tp == 1,
++                                                    kv_item=item)))
+         # an affine checkpoint's packed words at their stored precision; an EXL3 pack's by its own format
+         tensor_bytes = weight_transform(model_dir, one_gpu=tp == 1)
+         if exl3:
+@@ -138,7 +141,7 @@
+ 
+             plan = self.capacity_plan
+             spare = plan["budget_bytes"] - plan["weight_bytes_estimate"] - plan["cache_workspace_bytes_estimate"]
+-            self.room = KVRoom(self.cache, spare + live_kv(config(model_dir), 1, self.context_window))
++            self.room = KVRoom(self.cache, spare + live_kv(config(model_dir), 1, self.context_window, item))
+         # ``streams`` > 1: up to that many requests decoded together, their windows verified in one forward
+         self.concurrent = streams > 1
+         self.multi = self.scheduler = None
+--- tensorfold/families/qwen3_5/cuda/forward.py
++++ tensorfold/families/qwen3_5/cuda/forward.py
+@@ -8,7 +8,7 @@
+ import numpy as np
+ import torch
+ 
+-from tensorfold.cuda import moe
++from tensorfold.cuda import kv_fp8, moe
+ from tensorfold.cuda.kernels import attention as tree_attention
+ from tensorfold.cuda.kernels import gdn as deltanet
+ 
+@@ -120,8 +120,9 @@
+             else:
+                 self.conv.append(None)
+                 self.rec.append(None)
+-                self.kv.append((torch.empty((0, c.kv_heads, c.head_dim), device=device, dtype=torch.bfloat16),
+-                                torch.empty((0, c.kv_heads, c.head_dim), device=device, dtype=torch.bfloat16)))
++                kind = kv_fp8.dtype()
++                self.kv.append((torch.empty((0, c.kv_heads, c.head_dim), device=device, dtype=kind),
++                                torch.empty((0, c.kv_heads, c.head_dim), device=device, dtype=kind)))
+ 
+ 
+ @dataclass
+@@ -261,6 +262,7 @@
+             q, key = glue.attn_prep(qg, key, attn.q_norm, attn.k_norm, pos,
+                                     w.inv_freq, c.eps, heads=c.heads, kv_heads=c.kv_heads,
+                                     head_dim=c.head_dim, mscale=c.rope_mscale)
++            key, value = kv_fp8.round(key), kv_fp8.round(value)      # the rows as the cache holds them
+             out = tree_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
+             gated, out_xs = glue.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim)
+             r = _row_mm(gated, attn.o, tp, out_xs)
+@@ -370,6 +372,7 @@
+             q, key = glue.attn_prep(qg, key, attn.q_norm, attn.k_norm, pos,
+                                     w.inv_freq, c.eps, heads=c.heads, kv_heads=c.kv_heads,
+                                     head_dim=c.head_dim, mscale=c.rope_mscale)
++            key, value = kv_fp8.round(key), kv_fp8.round(value)      # the rows as the cache holds them
+             out = tree_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
+             gated, out_xs = glue.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim)
+             r = _row_mm(gated, attn.o, tp, out_xs)
+--- tensorfold/families/qwen3_5/cuda/multi.py
++++ tensorfold/families/qwen3_5/cuda/multi.py
+@@ -101,7 +101,9 @@
+         self.overhead = (8.0, 1.5)                            # a round's other ms: fixed, and per stream
+         # one GPU: a stream's caches hold its prompt, then grow a step at a time while the gate has room
+         c, att = w.config, sum(1 for layer in getattr(w, "layers", ()) if not layer.linear)
+-        self.layer_bytes = 2 * getattr(c, "kv_heads", 0) * getattr(c, "head_dim", 0) * 2     # a row of one layer
++        from tensorfold.cuda import kv_fp8
++
++        self.layer_bytes = 2 * getattr(c, "kv_heads", 0) * getattr(c, "head_dim", 0) * kv_fp8.itemsize()   # a row of one layer
+         self.row_bytes = att * self.layer_bytes
+         self.memory_gate = (MemoryGate(1 << 62, reserve=2 * GIB, live=torch_live(torch, available_bytes))
+                      if world == 1 and torch.cuda.is_available() else None)
+--- tensorfold/families/qwen3_5/cuda/prefill.py
++++ tensorfold/families/qwen3_5/cuda/prefill.py
+@@ -6,7 +6,7 @@
+ 
+ import torch
+ 
+-from tensorfold.cuda import moe, prompt_precision
++from tensorfold.cuda import kv_fp8, moe, prompt_precision
+ from tensorfold.cuda.kernels import gdn as deltanet
+ from tensorfold.cuda.kernels import qmm as shared
+ from tensorfold.cuda.kernels.prefill_attention import attention
+@@ -110,10 +110,13 @@
+             q, key = glue.attn_prep(qg, key, attn.q_norm, attn.k_norm, pos, w.inv_freq, c.eps, heads=c.heads,
+                                     kv_heads=c.kv_heads, head_dim=c.head_dim, mrope_section=c.mrope_section,
+                                     mscale=c.rope_mscale)
++            key, value = kv_fp8.round(key), kv_fp8.round(value)      # the rows as the cache holds them
+             kbuf, vbuf = _grow(st, i, p0 + W)
+             kbuf[p0:p0 + W] = key.view(W, c.kv_heads, c.head_dim)
+             vbuf[p0:p0 + W] = value
+-            out = attention(q.view(W, c.heads, c.head_dim), kbuf, vbuf, p0, scale=c.head_dim ** -0.5)
++            # the prompt kernel reads bf16: an FP8 cache's rows so far, widened (exact), for this layer only
++            out = attention(q.view(W, c.heads, c.head_dim), kv_fp8.dense(kbuf, p0 + W), kv_fp8.dense(vbuf, p0 + W), p0,
++                            scale=c.head_dim ** -0.5)
+             r = _row_mm(pg.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim), attn.o, tp)
+         if layer.moe is not None:                          # routed experts read bf16 rows (their prefill form)
+             x, h, _ = glue.add_rmsnorm(x, r, layer.post_norm, c.eps)

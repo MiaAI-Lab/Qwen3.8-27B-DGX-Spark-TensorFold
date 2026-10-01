@@ -1,0 +1,34 @@
+Qwen3.8-27B on one DGX Spark (TensorFold)
+Copyright 2026 the Qwen3.8-27B-DGX-Spark-TensorFold contributors
+
+This repository is licensed under the Apache License, Version 2.0 (LICENSE).
+
+It contains, or modifies, the following work by others:
+
+1. TensorFold (https://github.com/ashhart/TensorFold), Apache-2.0 from v0.6.0. Every file in patches/ is a modification
+   of TensorFold v0.6.0 (commit c464617); each patch's header says what it changes. TensorFold's own NOTICE follows.
+
+   ----------------------------------------------------------------------
+   TensorFold
+   Copyright 2026 TensorFold contributors
+   https://github.com/ashhart/TensorFold
+
+   TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.0.
+   Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
+   MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
+   THIRD_PARTY_NOTICES.md.
+   ----------------------------------------------------------------------
+
+   TensorFold code written before 0.6.0 keeps its MIT notice: LICENSES/MIT-TensorFold-before-0.6.0.txt. TensorFold's
+   third-party notices (MLX, mlx-lm, mlx-vlm, ExLlamaV3, transformers and others):
+   https://github.com/ashhart/TensorFold/blob/v0.6.0/THIRD_PARTY_NOTICES.md
+
+2. The Qwen3.8 Flash Next recipe by MiaAI-Lab
+   (https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold), MIT, copyright (c) 2026 MiaAI-Lab
+   (LICENSES/MIT-MiaAI-Lab.txt). start.sh, stop.sh, scripts/prepare.sh, scripts/config.sh, tools/bench.py,
+   tools/needle.py, tools/toolcheck.py and tools/visioncheck.py are adapted from it, and patches/0001 carries its video
+   code (vision/videos.py and the video parts of vision/qwen_processing.py and vision/qwen_cuda.py). MIT is a
+   permissive license: those parts stay under its notice while the repository as a whole is under Apache-2.0.
+
+Not part of this repository and under their own terms: the model weights (Qwen Community License 1.0), NVIDIA's PyTorch
+container image (NVIDIA Software License Agreement) and the Python packages the image installs. See CREDITS.md.

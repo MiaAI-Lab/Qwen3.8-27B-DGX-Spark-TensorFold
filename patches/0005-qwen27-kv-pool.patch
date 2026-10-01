@@ -1,0 +1,184 @@
+Qwen3.8-27B on TensorFold v0.6.0 (c464617): a pinned attention-cache pool for the concurrent decoder (one GPU).
+TENSORFOLD_KV_POOL_GIB=78 reserves that much cache memory once startup is done (one block, touched so its pages are real,
+freed into torch's allocator and never released: the decoder's cache-trimming calls become no-ops). The streams' caches and
+the kept prompt states grow inside it; the memory gate counts what torch holds beyond the weights and fixed buffers
+against the pool instead of asking the host's free memory. The startup estimate counts the pool instead of caches that grow.
+Unset, nothing changes. Applies after 0004.
+
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -370,8 +370,8 @@
+ 
+ 
+ def stream_geometry(t: dict, world: int, streams: int, keep: int, *, first: int | None = None,
+-                    kv_item: int = 2) -> Geometry:
+-    """The 27B's concurrent decoder: live streams, ``keep`` kept prompt ends, windows; ``first``: growth on one GPU; ``kv_item``: bytes a cached value."""
++                    kv_item: int = 2, pool: int = 0) -> Geometry:
++    """The 27B's concurrent decoder: live streams, ``keep`` kept prompt ends, windows; ``first``: growth on one GPU; ``kv_item``: bytes a cached value; ``pool``: bytes of attention cache pinned for every stream together (instead of caches that grow)."""
+ 
+     linear, attention = layer_counts(t)
+     d, h, hk, hd, nk, nv, dk, dv, width = _gdn_dims(t, world)
+@@ -387,6 +387,8 @@
+         kv = attention * capacity * hk * hd * 2 * kv_item
+         caches = (streams + keep + 1) * kv if first is None else \
+             kv + (streams + keep) * attention * min(first, capacity) * hk * hd * 2 * kv_item
++        if pool:
++            caches = pool                                 # pinned: every stream and kept prompt state draws from it
+         scratch = rows * h * (hd + 2) * ((capacity + 511) // 512) * 4
+         if kv_item == 1:                              # the prompt kernel reads bf16: one layer's widened keys and values
+             scratch += 2 * capacity * hk * hd * 2
+--- tensorfold/cuda/kv_fp8.py
++++ tensorfold/cuda/kv_fp8.py
+@@ -44,3 +44,18 @@
+     """The cache's first ``rows`` rows as bf16 (the prompt-attention kernel reads bf16): exact, e4m3 fits bf16."""
+ 
+     return cache[:rows] if cache.dtype == torch.bfloat16 else cache[:rows].to(torch.bfloat16)
++
++
++def pool_bytes() -> int:
++    """``TENSORFOLD_KV_POOL_GIB``: GiB of attention cache to pin for the concurrent streams at startup (0: grow on demand)."""
++
++    value = os.environ.get("TENSORFOLD_KV_POOL_GIB", "").strip()
++    if not value:
++        return 0
++    try:
++        gib = float(value)
++    except ValueError:
++        gib = float("nan")
++    if not gib >= 0:
++        raise ValueError(f"TENSORFOLD_KV_POOL_GIB={value}: a number of GiB, 0 or more")
++    return int(gib * 1024**3)
+--- tensorfold/cuda/memory_gate.py
++++ tensorfold/cuda/memory_gate.py
+@@ -31,10 +31,25 @@
+         self.held = max(0, self.held - int(freed))
+ 
+ 
++class PoolGate(MemoryGate):
++    """A pinned pool: ``fits`` asks whether what torch holds beyond ``base`` (the weights and fixed buffers at the time the
++    pool was taken) plus ``extra`` stays within ``pool``. The pool is already ours, so the host's free memory is not asked."""
++
++    def __init__(self, pool: int, base: int, torch) -> None:
++        super().__init__(pool, 0, None)
++        self.base, self.torch = int(base), torch
++
++    def used(self) -> int:
++        return max(0, int(self.torch.cuda.memory_allocated()) - self.base)
++
++    def fits(self, extra: int) -> bool:
++        return self.used() + int(extra) <= self.room
++
++
+ def torch_live(torch, available: Callable) -> Callable[[], int]:
+     """What the host has free now plus what torch's allocator holds freed (it reuses those without asking)."""
+ 
+     return lambda: int(available(torch)) + int(torch.cuda.memory_reserved()) - int(torch.cuda.memory_allocated())
+ 
+ 
+-__all__ = ["MemoryGate", "NoRoom", "torch_live"]
++__all__ = ["MemoryGate", "NoRoom", "PoolGate", "torch_live"]
+--- tensorfold/families/qwen3_5/cuda/engine.py
++++ tensorfold/families/qwen3_5/cuda/engine.py
+@@ -86,8 +86,9 @@
+         # prompt chunks sized to the card (4096 rows from 80 GB), the verify scratch to the rows a round takes
+         chunk = prompt_rows(total_bytes(torch), prompt_row_bytes(config(model_dir), tp))
+         item = kv_fp8.itemsize()               # bytes a cached key or value: 2 (bf16), or 1 with TENSORFOLD_KV_DTYPE=fp8
++        pool = kv_fp8.pool_bytes() if many and tp == 1 else 0
+         geometry = ((lambda text: stream_geometry(text, tp, streams, keep, first=256 if tp == 1 else None,
+-                                                  kv_item=item)) if many
++                                                  kv_item=item, pool=pool)) if many
+                     else (lambda text: gdn_geometry(text, tp, max_rows, rows=max_rows, prompt=chunk, evicts=tp == 1,
+                                                     kv_item=item)))
+         # an affine checkpoint's packed words at their stored precision; an EXL3 pack's by its own format
+@@ -155,11 +156,15 @@
+                                       vision=self.vision)
+             self.multi.model_dir = self.model_dir             # rank 1 compiles a request's grammar from it
+             self.multi.calibrate(streams)
++            if pool:
++                self.multi.pin(pool)
+             if rank == 0:
+                 print(f"[tensorfold] {streams} streams of {self.context_window} prompt/reply tokens, {keep} prompt "
+                       "states kept" if tp == 2 else
+                       f"[tensorfold] up to {streams} streams, each growing to {self.context_window} prompt/reply "
+-                      f"tokens while memory lasts, {keep} prompt states kept", flush=True)
++                      + (f"tokens inside a pinned {pool / 1024**3:.1f} GiB cache pool "
++                         f"({pool // self.multi.row_bytes:,} tokens), " if pool else "tokens while memory lasts, ")
++                      + f"{keep} prompt states kept", flush=True)
+                 curve = ", ".join(f"{r}: {ms:.1f}" for r, ms in self.multi.costs)
+                 print(f"[tensorfold] verify ms by rows (tree widths follow it): {curve}", flush=True)
+                 self.scheduler = Scheduler(self.multi, max_streams=streams)
+--- tensorfold/families/qwen3_5/cuda/multi.py
++++ tensorfold/families/qwen3_5/cuda/multi.py
+@@ -9,7 +9,7 @@
+ 
+ from tensorfold.cuda.capacity import available_bytes
+ from tensorfold.cuda.markers import MIN_GAP
+-from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
++from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, PoolGate, torch_live
+ from tensorfold.cuda.sampling import sample_streams
+ from tensorfold.cuda.streams import PrefixCache, Stream, accept, next_fill
+ from tensorfold.engine.grammar import GrammarError, pack
+@@ -80,6 +80,7 @@
+     """The ``Scheduler``'s decoder on one GPU or as ``rank`` of two; a stream's window holds at most 16 rows."""
+ 
+     memory_gate: MemoryGate | None = None     # one GPU: streams' caches grow by use (two ranks reserve up front)
++    pinned = False                            # one GPU: a pool of cache memory reserved at startup (``pin``)
+ 
+     def __init__(self, w: Weights, draft=None, *, max_rows: int = 16, allow_copy: bool = True, stop_eos: bool = True,
+                  keep: int = 8, rank: int = 0, world: int = 1, context: int = 0, points=None, vision=None) -> None:
+@@ -113,6 +114,25 @@
+     def live(self) -> int:
+         return len(self.streams) + len(self.filling)
+ 
++    def pin(self, pool: int) -> None:
++        """Reserve ``pool`` bytes for the streams' attention caches now, and keep them: one block taken from the system,
++        touched so its pages are really there, and handed back to torch's allocator without releasing it. Caches then
++        grow inside it (``PoolGate`` counts what they hold); nothing here gives memory back to the system again."""
++
++        torch.cuda.synchronize()
++        base = torch.cuda.memory_allocated()
++        block = torch.empty(int(pool), dtype=torch.uint8, device=self.device)
++        block.zero_()                                 # commit the pages (a unified GPU maps them on first touch)
++        del block                                     # freed into torch's cache: reserved, and reused by the caches
++        self.memory_gate = PoolGate(int(pool), base, torch)
++        self.pinned = True
++
++    def _trim(self) -> None:
++        """Give freed buffers back to the system (so MemAvailable stays true); a pinned pool keeps them."""
++
++        if not self.pinned:
++            torch.cuda.empty_cache()
++
+     def _send(self, values: list[int]) -> None:
+         if self.world == 2 and self.broken is None:
+             _share(values, 0, self.device)
+@@ -185,7 +205,7 @@
+                 if not self.live():
+                     return                          # alone: startup fitted one stream's whole window
+                 raise NoRoom(f"a {len(s.prompt)}-token prompt waits for memory until a live stream finishes")
+-            torch.cuda.empty_cache()
++            self._trim()
+ 
+     def _grow(self, st: State, have: int, size: int, alone: bool) -> bool:
+         """Grow ``st``'s caches from ``have`` to ``size`` rows while the gate has room (a layer's copy at a time)."""
+@@ -195,9 +215,9 @@
+                 if alone:
+                     break                           # startup fitted one stream's whole window
+                 return False
+-            torch.cuda.empty_cache()
++            self._trim()
+         reserve(st, size)
+-        torch.cuda.empty_cache()                    # the old buffers back to the system: MemAvailable stays true
++        self._trim()                                # the old buffers back to the system: MemAvailable stays true
+         return True
+ 
+     def _make_room(self, live: list[Stream]) -> list[Stream]:
+@@ -224,7 +244,7 @@
+             self.memory_gate.ends += 1
+             self.streams.pop(newest.sid, None)
+             newest.st = None                         # its caches go now (a cached prompt end may still view them)
+-            torch.cuda.empty_cache()
++            self._trim()
+             return [newest, *self._make_room(live[:-1])]
+         self.memory_gate.waits += any(s.waiting for s in live)
+         return []
