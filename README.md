@@ -1,4 +1,15 @@
-# Qwen3.8-27B on one DGX Spark (TensorFold)
+<h1 align="center">Qwen3.8-27B on one DGX Spark (TensorFold)</h1>
+
+<p align="center">
+  <sub>by <a href="https://x.com/MiaAI_lab">Mia's AI Lab</a></sub>
+  <br><br>
+  <a href="https://github.com/sponsors/MiaAI-Lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Sponsor%20me%20on%20GitHub-181717?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor me on GitHub" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
+  <a href="https://x.com/MiaAI_lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
+</p>
+
+<p align="center">
+  <img src=".github/image.png" alt="Qwen3.8 27B on TensorFold, single DGX Spark" width="100%" />
+</p>
 
 Serve **Qwen3.8-27B** from a single NVIDIA DGX Spark (GB10, 128 GB) through an OpenAI-compatible API, with up to
 **8 concurrent requests**, a **pinned 78 GiB KV pool (2.5M tokens)**, the full **262,144-token context**, DFlash2 speculative decoding, **up to 50 images and video input**. It runs
